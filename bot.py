@@ -1,27 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Telegram-бот: крестики-нолики + камень-ножницы-бумага + ИИ с памятью чата
+Telegram-бот: мини-игры + парсинг картинок + ИИ с мимикрией под стиль чата
 ============================================================================
-
-ИИ подключён через Groq API (бесплатно, ключ без карты: https://console.groq.com/keys).
-
-Логика ответов ИИ:
-  - Если кто-то отвечает (reply) на сообщение бота -> бот отвечает через ИИ.
-  - Если бота тегают (@имя_бота) -> бот отвечает через ИИ.
-  - Бот запоминает последние сообщения в чате (кто что писал) и использует
-    это как контекст — можно спросить "что думаешь про Алису" и т.п.
-  - По умолчанию бот дружелюбный, без мата. Материться/подкалывать будет,
-    только если его явно об этом попросить в сообщении.
-
-Запуск:
-    1) pip install -r requirements.txt
-    2) export BOT_TOKEN="токен_от_BotFather"
-    3) export GROQ_API_KEY="ключ_с_console.groq.com"
-    4) python bot.py
 """
 
 import logging
 import os
+import random
+import urllib.parse
 from collections import defaultdict, deque
 
 import requests
@@ -37,24 +23,32 @@ from telegram.ext import (
 )
 
 # ------------------------------------------------------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8904475192:AAGjGjKqtOr4o0HwX71p1hZ9nMTHnCSXO-A")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
 GROQ_MODEL = "llama-3.3-70b-versatile"  # бесплатная модель на Groq
 
 # сколько последних сообщений чата помнит бот
-HISTORY_MAXLEN = 40
+HISTORY_MAXLEN = 50
+
+# шанс, что бот САМ влезет в разговор без тега/реплая (0.03 = 3%)
+AI_RANDOM_CHANCE = 0.03
 
 # ====== ТВОЙ ПРОМПТ ЛИЧНОСТИ БОТА — меняй под себя ======
 SYSTEM_PROMPT = (
-    "Ты — обычный участник чата по имени Bot, общаешься живо и неформально, как человек, "
-    "а не как формальный ассистент. По умолчанию ты дружелюбный, без мата и без грубости. "
-    "Если тебя явно просят материться, обозвать в шутку или ответить жёстко — можешь материться "
-    "и подкалывать в ответ, но только когда об этом прямо просят, не сам по себе. "
-    "Тебе доступна история последних сообщений чата (ниже) — используй её, чтобы отвечать по теме, "
-    "вспоминать кто что писал, и высказывать мнение о людях на основе их сообщений, если спросят. "
-    "Если спросят, какие есть мини-игры в этом чате — отвечай, что есть команда /ttt (крестики-нолики) "
-    "и /rps (камень-ножницы-бумага). "
-    "Отвечай коротко, 1-3 предложения."
+    "Ты — живой, весёлый и общительный участник чата по имени Bot. Общаешься неформально, как реальный человек. "
+    "По умолчанию ты дружелюбный, вежливый, не используешь мат и не хамишь.\n\n"
+    "ТВОЯ ГЛАВНАЯ ФИШКА — МИМИКРИЯ:\n"
+    "Внимательно изучай историю последних сообщений чата, переданную ниже. Анализируй, как общаются участники чата. "
+    "Перенимай их манеру речи, используй их сленг, сокращения, смайлики и любимые словечки. "
+    "Старайся общаться и строить фразы точно так же, как люди в этом чате, подстраивайся под их стиль и повторяй их выражения, когда это уместно.\n\n"
+    "ОДНАКО, если тебя прямо в тексте сообщения попросят сматериться, подколоть, жестко ответить или пообзываться "
+    "(например, используют фразы 'пообзывайся со мной', 'матерись', 'ответь жестко', 'обзови'), "
+    "то тебе СТРОГО РАЗРЕШЕНО и необходимо жестко материться, использовать грязные словечки и угарно, токсично обзывать собеседника в ответ.\n\n"
+    "Используй историю чата, чтобы отвечать строго по теме, вспоминать, кто что писал, "
+    "и высказывать своё честное мнение о людях (например, об Элис/Алисе или других участниках), если тебя об этом спросят.\n"
+    "Если тебя спрашивают, какие есть мини-игры в чате, обязательно перечисли доступные команды: /ttt (крестики-нолики), "
+    "/rps (камень-ножницы-бумага), /dice (кубик), /dart (дротики) и /slots (казино).\n"
+    "Отвечай кратко, сочно, в 1-3 предложения."
 )
 # ==========================================================
 
@@ -68,7 +62,6 @@ logger = logging.getLogger(__name__)
 # ПАМЯТЬ ЧАТА
 # ------------------------------------------------------------------
 
-# chat_id -> deque[(имя, текст)]
 chat_history: dict = defaultdict(lambda: deque(maxlen=HISTORY_MAXLEN))
 
 
@@ -82,7 +75,7 @@ def render_history(chat_id: int) -> str:
 
 
 # ------------------------------------------------------------------
-# ВЫЗОВ ИИ (Groq, OpenAI-совместимый API)
+# ВЫЗОВ ИИ
 # ------------------------------------------------------------------
 
 
@@ -94,7 +87,7 @@ def ask_ai(chat_id: int, sender_name: str, user_text: str) -> str:
     user_content = (
         f"История последних сообщений чата:\n{history_block}\n\n"
         f"Новое сообщение от {sender_name}: {user_text}\n\n"
-        f"Ответь на это сообщение."
+        f"Ответь на это сообщение согласно своим правилам личности и скопируй стиль чата."
     )
 
     try:
@@ -110,7 +103,7 @@ def ask_ai(chat_id: int, sender_name: str, user_text: str) -> str:
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_content},
                 ],
-                "max_tokens": 200,
+                "max_tokens": 250,
                 "temperature": 0.9,
             },
             timeout=20,
@@ -127,7 +120,7 @@ def ask_ai(chat_id: int, sender_name: str, user_text: str) -> str:
 # КРЕСТИКИ-НОЛИКИ
 # ==================================================================
 
-ttt_games: dict = {}  # chat_id -> game state
+ttt_games: dict = {}
 
 EMPTY, X, O = " ", "X", "O"
 WIN_LINES = [
@@ -272,7 +265,7 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # КАМЕНЬ-НОЖНИЦЫ-БУМАГА
 # ==================================================================
 
-rps_games: dict = {}  # chat_id -> game state
+rps_games: dict = {}
 
 RPS_CHOICES = {"rock": "🪨 Камень", "scissors": "✂️ Ножницы", "paper": "📄 Бумага"}
 RPS_BEATS = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
@@ -380,7 +373,23 @@ async def rps_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ==================================================================
-# ИИ-ОБРАБОТЧИК СООБЩЕНИЙ (память чата + ответы по тегу/реплаю)
+# СВЕЖИЕ МИНИ-ИГРЫ (Кубик, Дартс, Казино-слоты)
+# ==================================================================
+
+async def cmd_dice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_dice(emoji="🎲")
+
+
+async def cmd_dart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_dice(emoji="🎯")
+
+
+async def cmd_slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_dice(emoji="🎰")
+
+
+# ==================================================================
+# ИИ-ОБРАБОТЧИК СООБЩЕНИЙ (с мимикрией, перенаправлением и фото-поиском)
 # ==================================================================
 
 ai_disabled_chats: set = set()
@@ -410,8 +419,9 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     sender_name = user.first_name if user else "Кто-то"
+    text_lower = message.text.lower()
 
-    # запоминаем сообщение в истории чата в любом случае
+    # запоминаем абсолютно каждое сообщение в историю для анализа стиля
     add_to_history(chat.id, sender_name, message.text)
 
     if chat.id in ai_disabled_chats:
@@ -423,30 +433,76 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         and message.reply_to_message.from_user is not None
         and message.reply_to_message.from_user.id == context.bot.id
     )
-    is_mentioned = bool(bot_username) and f"@{bot_username}".lower() in message.text.lower()
+    is_mentioned = bool(bot_username) and f"@{bot_username}".lower() in text_lower
 
-    if not (is_reply_to_bot or is_mentioned):
+    # Срабатывает при теге/реплае, либо сам по себе с шансом ровно 3%
+    should_respond = is_reply_to_bot or is_mentioned or (random.random() < AI_RANDOM_CHANCE)
+
+    if not should_respond:
         return
 
+    # Логика «ответь этому человеку»:
+    target_message = message
+    if message.reply_to_message and not is_reply_to_bot:
+        if any(w in text_lower for w in ["ответь", "скажи", "напиши", "поясни", "обзови", "ругни"]):
+            target_message = message.reply_to_message
+
+    # ПРОВЕРКА НА ЗАПРОС КАРТИНКИ С ИНТЕРНЕТА
+    photo_triggers = ["скинь фото", "скинь картинку", "покажи фото", "покажи картинку"]
+    if any(trigger in text_lower for trigger in photo_triggers):
+        query = ""
+        for trigger in ["скинь фото там где", "скинь фото где", "скинь картинку где", "скинь фото", "скинь картинку", "покажи фото", "покажи картинку"]:
+            if trigger in text_lower:
+                idx = text_lower.index(trigger) + len(trigger)
+                query = message.text[idx:].strip()
+                # Очищаем запрос от тега бота, если он там остался
+                if bot_username and f"@{bot_username}".lower() in query.lower():
+                    query = query.replace(f"@{bot_username}", "").replace(f"@{bot_username.lower()}", "").strip()
+                break
+        
+        if not query:
+            query = "funny random"
+
+        encoded_query = urllib.parse.quote(query)
+        # loremflickr динамически подбирает и редиректит на актуальное фото по ключевым словам
+        photo_url = f"https://loremflickr.com/800/600/{encoded_query}"
+        
+        await context.bot.send_chat_action(chat_id=chat.id, action="upload_photo")
+        try:
+            await target_message.reply_photo(photo=photo_url, caption=f"Лови картинку: {query}")
+            add_to_history(chat.id, "Bot", f"[Отправил фото: {query}]")
+            return
+        except Exception as e:
+            logger.error("Ошибка при отправке фото: %s", e)
+
+    # ОБЫЧНЫЙ СТАНДАРТНЫЙ ОТВЕТ ИИ (С МИМИКРИЕЙ ФРАЗ)
     await context.bot.send_chat_action(chat_id=chat.id, action="typing")
     reply_text = ask_ai(chat.id, sender_name, message.text)
+    
     add_to_history(chat.id, "Bot", reply_text)
-    await message.reply_text(reply_text)
+    await target_message.reply_text(reply_text)
 
 
 # ==================================================================
 # СЛУЖЕБНЫЕ КОМАНДЫ
 # ==================================================================
 
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Привет! Я умею:\n"
+        "Привет! Я многофункциональный бот, умеющий подстраиваться под ваш стиль общения. Вот мои команды:\n\n"
+        "🎮 Игры:\n"
         "/ttt — крестики-нолики\n"
-        "/rps — камень-ножницы-бумага\n\n"
-        "Ответь на моё сообщение или тегни меня — отвечу и помню, о чём мы говорили в чате.\n"
-        "/forget — забыть историю чата\n"
-        "/aioff — выключить мою болтовню, /aion — включить обратно."
+        "/rps — камень-ножницы-бумага\n"
+        "/dice — кинуть кубик\n"
+        "/dart — сыграть в дротики\n"
+        "/slots — запустить игровой автомат\n\n"
+        "🧠 ИИ-Настройки:\n"
+        "/forget — очистить историю памяти этого чата\n"
+        "/aioff — полностью отключить ИИ, /aion — включить обратно.\n\n"
+        "Фишки:\n"
+        "1. Я полностью запоминаю контекст общения и со временем перенимаю ваши фразы, сленг и стиль речи!\n"
+        "2. Могу искать фото. Просто тегни меня и напиши: 'скинь фото там где кошка' или 'покажи картинку с машиной'.\n"
+        "3. Если хочешь, чтобы я пообзывался или сматерился — просто прямо попроси меня об этом в сообщении."
     )
 
 
@@ -460,18 +516,21 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("ttt", cmd_ttt))
     app.add_handler(CommandHandler("rps", cmd_rps))
+    app.add_handler(CommandHandler("dice", cmd_dice))
+    app.add_handler(CommandHandler("dart", cmd_dart))
+    app.add_handler(CommandHandler("slots", cmd_slots))
     app.add_handler(CommandHandler("aioff", cmd_aioff))
     app.add_handler(CommandHandler("aion", cmd_aion))
     app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(CallbackQueryHandler(ttt_callback, pattern=r"^ttt:"))
     app.add_handler(CallbackQueryHandler(rps_callback, pattern=r"^rps:"))
 
-    # ИИ-обработчик должен идти последним и не трогать команды
+    # ИИ-обработчик идет в самом конце
     app.add_handler(
         MessageHandler(filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND, ai_handler)
     )
 
-    logger.info("Бот запущен, жду сообщений...")
+    logger.info("Бот успешно обновлен и запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
